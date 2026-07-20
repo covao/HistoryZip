@@ -26,18 +26,17 @@ download specific versions. The most recent version can also be
 permanently deleted from the version history.
 
 Storage: the --data directory is temporary scratch space only. It is
-wiped clean every time this server process starts, so nothing persists
-across restarts. Use "Download history ZIP" to save state permanently,
-and re-upload it later to resume work.
+wiped clean every time this server process starts, and can also be wiped
+on demand from the UI via the "Clear" button. Use "Download history ZIP"
+to save state permanently, and re-upload it later to resume work.
 
 Dependencies: Python standard library only, plus a system `git` binary.
 
 Usage:
     python3 historyzip_app.py [--port 8765] [--data ./data]
 
-Then open http://localhost:8765/ in a browser.
-URL parameter example:
-    http://localhost:8765/?project=myapp
+Then open http://localhost:8765/ in a browser. This app manages a single
+project at a time; use "Clear" in the UI to wipe it and start over.
 """
 
 import argparse
@@ -46,6 +45,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -78,6 +78,61 @@ TASKS_LOCK = threading.Lock()
 # versions of this app) that still contain these files are also cleaned
 # up on export.
 HISTORY_ZIP_EXCLUDE = {"manifest.json", "versions.json", "ZIP_HISTORY_README.md"}
+
+
+def _clear_readonly_and_retry(func, path, exc):
+    """Error handler for shutil.rmtree().
+
+    Git writes loose objects under `.git/objects/**` (and some other
+    internal files) as read-only. On POSIX this doesn't block deletion,
+    because Unix decides deletability from the *containing directory's*
+    write permission, not the file's own mode bits. Windows ties deletion
+    to the file's own read-only attribute instead, so removing/replacing an
+    existing `.git` folder fails there with PermissionError / WinError 5
+    unless the read-only attribute is cleared first. Clear it and retry.
+    """
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except OSError:
+        pass
+    func(path)
+
+
+def force_rmtree(path):
+    """shutil.rmtree() that also clears Git's read-only file attribute, so
+    that removing/replacing an existing repository works on Windows too."""
+    if not os.path.exists(path):
+        return
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
+    else:
+        shutil.rmtree(path, onerror=_clear_readonly_and_retry)
+
+
+def force_remove(path):
+    """os.remove() that also clears Git's read-only file attribute first,
+    for the same reason as force_rmtree() above."""
+    try:
+        os.remove(path)
+    except PermissionError:
+        os.chmod(path, stat.S_IWRITE)
+        os.remove(path)
+
+
+def clear_data_dir(data_dir):
+    """Delete everything under the data directory and recreate it empty.
+    Used at server startup, where the folder should exist and be ready
+    immediately."""
+    force_rmtree(data_dir)
+    os.makedirs(data_dir, exist_ok=True)
+
+
+def remove_data_dir(data_dir):
+    """Delete the data directory itself (not just its contents), leaving
+    no folder behind on disk. Used by the "Clear" button. The directory is
+    recreated automatically (via os.makedirs) the next time it is needed,
+    e.g. by the next upload."""
+    force_rmtree(data_dir)
 
 
 def now_iso():
@@ -215,21 +270,8 @@ def git_log_entries(repo_dir):
 # ZIP helpers
 # --------------------------------------------------------------------------
 
-def safe_project_name(name):
-    name = (name or "project").strip()
-    keep = [c for c in name if c.isalnum() or c in "-_."]
-    s = "".join(keep) or "project"
-    return s[:80]
-
-
-def project_root(data_dir, project):
-    d = os.path.join(data_dir, safe_project_name(project))
-    os.makedirs(d, exist_ok=True)
-    return d
-
-
-def worktree_dir(proot):
-    return os.path.join(proot, "project")
+def worktree_dir(data_dir):
+    return os.path.join(data_dir, "project")
 
 
 def detect_zip_kind(zip_bytes):
@@ -246,21 +288,30 @@ def detect_zip_kind(zip_bytes):
     return "snapshot"
 
 
-def extract_zip_to_dir(zip_bytes, target_dir, progress_cb=None):
-    """Extract a ZIP (given as bytes) into target_dir. If the archive has a
-    single top-level folder, its contents are lifted up by one level."""
+def extract_zip_to_dir(zip_bytes, target_dir, progress_cb=None, strip_single_root=True):
+    """Extract a ZIP (given as bytes) into target_dir.
+
+    If strip_single_root is True (the default, used for snapshot ZIPs) and
+    the archive has a single top-level folder, its contents are lifted up
+    by one level - this is a convenience for users who zip a project by
+    right-clicking its containing folder. History ZIPs must NOT have their
+    top-level `project/` folder stripped this way (it is always the sole
+    top-level entry, but it is meaningful, not incidental wrapping), so
+    callers importing a history ZIP pass strip_single_root=False.
+    """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         names = zf.namelist()
-        roots = set()
-        for n in names:
-            if not n or n.startswith("__MACOSX"):
-                continue
-            roots.add(n.split("/")[0])
         strip_root = None
-        if len(roots) == 1:
-            only = list(roots)[0]
-            if all(n == only or n.startswith(only + "/") or n.startswith("__MACOSX") for n in names):
-                strip_root = only + "/"
+        if strip_single_root:
+            roots = set()
+            for n in names:
+                if not n or n.startswith("__MACOSX"):
+                    continue
+                roots.add(n.split("/")[0])
+            if len(roots) == 1:
+                only = list(roots)[0]
+                if all(n == only or n.startswith(only + "/") or n.startswith("__MACOSX") for n in names):
+                    strip_root = only + "/"
 
         total = len(names)
         for i, n in enumerate(names):
@@ -315,12 +366,11 @@ def zip_dir_to_bytes(src_dir, arc_prefix="", progress_cb=None, exclude_top_level
 # Core logic
 # --------------------------------------------------------------------------
 
-def do_upload_snapshot(tid, data_dir, project, filename, zip_bytes, tag, message):
+def do_upload_snapshot(tid, data_dir, filename, zip_bytes, tag, message):
     """Import a snapshot ZIP: diff against the current worktree and commit."""
     try:
         task_update(tid, message="Preparing...", progress=2)
-        proot = project_root(data_dir, project)
-        wdir = worktree_dir(proot)
+        wdir = worktree_dir(data_dir)
         is_new = not os.path.isdir(os.path.join(wdir, ".git"))
         os.makedirs(wdir, exist_ok=True)
 
@@ -345,9 +395,9 @@ def do_upload_snapshot(tid, data_dir, project, filename, zip_bytes, tag, message
                     continue
                 p = os.path.join(wdir, name)
                 if os.path.isdir(p):
-                    shutil.rmtree(p)
+                    force_rmtree(p)
                 else:
-                    os.remove(p)
+                    force_remove(p)
 
             task_update(tid, message="Extracting...", progress=15)
 
@@ -382,24 +432,25 @@ def do_upload_snapshot(tid, data_dir, project, filename, zip_bytes, tag, message
         task_update(tid, status="error", error=str(e), message="Error: %s" % e)
 
 
-def do_upload_history(tid, data_dir, project, zip_bytes):
-    """Import a history ZIP (project/.git ...), replacing the project state."""
+def do_upload_history(tid, data_dir, zip_bytes):
+    """Import a history ZIP (project/.git ...), replacing all current data."""
     try:
         task_update(tid, message="Extracting...", progress=5)
-        proot = project_root(data_dir, project)
-        for name in os.listdir(proot):
-            p = os.path.join(proot, name)
-            if os.path.isdir(p):
-                shutil.rmtree(p)
-            else:
-                os.remove(p)
+        if os.path.isdir(data_dir):
+            for name in os.listdir(data_dir):
+                p = os.path.join(data_dir, name)
+                if os.path.isdir(p):
+                    force_rmtree(p)
+                else:
+                    force_remove(p)
+        os.makedirs(data_dir, exist_ok=True)
 
         def cb(p):
             task_update(tid, progress=5 + int(p * 0.8))
 
-        extract_zip_to_dir(zip_bytes, proot, progress_cb=cb)
+        extract_zip_to_dir(zip_bytes, data_dir, progress_cb=cb, strip_single_root=False)
 
-        wdir = worktree_dir(proot)
+        wdir = worktree_dir(data_dir)
         if not os.path.isdir(os.path.join(wdir, ".git")):
             raise GitError(
                 "No 'project/.git' found in the uploaded archive. "
@@ -415,7 +466,7 @@ def do_upload_history(tid, data_dir, project, zip_bytes):
         task_update(tid, status="error", error=str(e), message="Error: %s" % e)
 
 
-def do_upload_auto(tid, data_dir, project, filename, zip_bytes, tag, message):
+def do_upload_auto(tid, data_dir, filename, zip_bytes, tag, message):
     """Entry point for the unified upload endpoint: detect the ZIP kind and
     dispatch to the matching handler."""
     try:
@@ -424,40 +475,37 @@ def do_upload_auto(tid, data_dir, project, filename, zip_bytes, tag, message):
         task_update(tid, status="error", error=str(e), message="Error: %s" % e)
         return
     if kind == "history":
-        do_upload_history(tid, data_dir, project, zip_bytes)
+        do_upload_history(tid, data_dir, zip_bytes)
     else:
-        do_upload_snapshot(tid, data_dir, project, filename, zip_bytes, tag, message)
+        do_upload_snapshot(tid, data_dir, filename, zip_bytes, tag, message)
 
 
-def do_zip_history(tid, data_dir, project):
+def do_zip_history(tid, data_dir):
     try:
-        proot = project_root(data_dir, project)
-        if not os.path.isdir(os.path.join(worktree_dir(proot), ".git")):
-            raise GitError("This project has no history yet.")
+        if not os.path.isdir(os.path.join(worktree_dir(data_dir), ".git")):
+            raise GitError("There is no history yet.")
 
         def cb(p):
             task_update(tid, progress=int(p))
 
         task_update(tid, message="Generating ZIP...", progress=1)
         data = zip_dir_to_bytes(
-            proot, arc_prefix="", progress_cb=cb, exclude_top_level=HISTORY_ZIP_EXCLUDE
+            data_dir, arc_prefix="", progress_cb=cb, exclude_top_level=HISTORY_ZIP_EXCLUDE
         )
         out_path = os.path.join(tempfile.gettempdir(), "historyzip_%s.zip" % tid)
         with open(out_path, "wb") as f:
             f.write(data)
-        name = "%s.zip" % safe_project_name(project)
-        task_update(tid, status="done", progress=100, message="Done", result_path=out_path, result_name=name)
+        task_update(tid, status="done", progress=100, message="Done", result_path=out_path, result_name="history.zip")
     except Exception as e:  # noqa
         task_update(tid, status="error", error=str(e), message="Error: %s" % e)
 
 
-def do_delete_latest(tid, data_dir, project):
+def do_delete_latest(tid, data_dir):
     """Permanently delete the most recent version (commit) from history."""
     try:
-        proot = project_root(data_dir, project)
-        wdir = worktree_dir(proot)
+        wdir = worktree_dir(data_dir)
         if not os.path.isdir(os.path.join(wdir, ".git")):
-            raise GitError("This project has no history yet.")
+            raise GitError("There is no history yet.")
 
         entries = git_log_entries(wdir)
         if len(entries) < 2:
@@ -475,13 +523,12 @@ def do_delete_latest(tid, data_dir, project):
         task_update(tid, status="error", error=str(e), message="Error: %s" % e)
 
 
-def do_zip_snapshot(tid, data_dir, project, version_ref):
+def do_zip_snapshot(tid, data_dir, version_ref):
     tmp_checkout = None
     try:
-        proot = project_root(data_dir, project)
-        wdir = worktree_dir(proot)
+        wdir = worktree_dir(data_dir)
         if not os.path.isdir(os.path.join(wdir, ".git")):
-            raise GitError("This project has no history yet.")
+            raise GitError("There is no history yet.")
 
         entries = git_log_entries(wdir)
         target = None
@@ -515,13 +562,16 @@ def do_zip_snapshot(tid, data_dir, project, version_ref):
         out_path = os.path.join(tempfile.gettempdir(), "historyzip_%s.zip" % tid)
         with open(out_path, "wb") as f:
             f.write(data)
-        name = "%s_%s.zip" % (safe_project_name(project), target["label"])
+        name = "%s.zip" % target["label"]
         task_update(tid, status="done", progress=100, message="Done", result_path=out_path, result_name=name)
     except Exception as e:  # noqa
         task_update(tid, status="error", error=str(e), message="Error: %s" % e)
     finally:
         if tmp_checkout and os.path.isdir(tmp_checkout):
-            shutil.rmtree(tmp_checkout, ignore_errors=True)
+            try:
+                force_rmtree(tmp_checkout)
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------
@@ -620,11 +670,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/" or path == "/index.html":
                 self._send_html(render_index_html())
             elif path == "/api/log":
-                project = qs.get("project", ["project"])[0]
-                proot = project_root(self.data_dir, project)
-                wdir = worktree_dir(proot)
+                wdir = worktree_dir(self.data_dir)
                 entries = git_log_entries(wdir)
-                self._send_json({"project": project, "versions": entries})
+                self._send_json({"versions": entries})
             elif path == "/api/task":
                 tid = qs.get("id", [""])[0]
                 t = task_get(tid)
@@ -670,26 +718,26 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/upload":
                 self._handle_upload(qs)
             elif path == "/api/zip_history":
-                project = qs.get("project", ["project"])[0]
                 tid = task_create()
-                th = threading.Thread(target=do_zip_history, args=(tid, self.data_dir, project), daemon=True)
+                th = threading.Thread(target=do_zip_history, args=(tid, self.data_dir), daemon=True)
                 th.start()
                 self._send_json({"task_id": tid})
             elif path == "/api/zip_snapshot":
-                project = qs.get("project", ["project"])[0]
                 version = qs.get("version", [""])[0]
                 tid = task_create()
                 th = threading.Thread(
-                    target=do_zip_snapshot, args=(tid, self.data_dir, project, version), daemon=True
+                    target=do_zip_snapshot, args=(tid, self.data_dir, version), daemon=True
                 )
                 th.start()
                 self._send_json({"task_id": tid})
             elif path == "/api/delete_latest":
-                project = qs.get("project", ["project"])[0]
                 tid = task_create()
-                th = threading.Thread(target=do_delete_latest, args=(tid, self.data_dir, project), daemon=True)
+                th = threading.Thread(target=do_delete_latest, args=(tid, self.data_dir), daemon=True)
                 th.start()
                 self._send_json({"task_id": tid})
+            elif path == "/api/clear":
+                remove_data_dir(self.data_dir)
+                self._send_json({"status": "ok"})
             else:
                 self._send_error_json("not found", 404)
         except Exception as e:  # noqa
@@ -707,7 +755,6 @@ class Handler(BaseHTTPRequestHandler):
         if "file" not in files:
             self._send_error_json("file field required", 400)
             return
-        project = qs.get("project", [fields.get("project", "project")])[0]
         tag = fields.get("tag", "")
         message = fields.get("message", "")
         filename = files["file"]["filename"] or "upload.zip"
@@ -716,7 +763,7 @@ class Handler(BaseHTTPRequestHandler):
         tid = task_create()
         th = threading.Thread(
             target=do_upload_auto,
-            args=(tid, self.data_dir, project, filename, data, tag, message),
+            args=(tid, self.data_dir, filename, data, tag, message),
             daemon=True,
         )
         th.start()
@@ -901,8 +948,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
       <div class="section">
         <h2>Download history ZIP</h2>
-        <label>Project name</label>
-        <input type="text" id="projectName" value="project">
         <div class="muted">Exports the full current state, including .git.</div>
         <button id="btnDownloadHist">Generate &amp; download</button>
         <div class="progress-wrap" id="pwZipHist">
@@ -937,9 +982,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script>
 (function(){
   "use strict";
-
-  // ---- URL parameters ----
-  var params = new URLSearchParams(location.search);
 
   function $(id){ return document.getElementById(id); }
 
@@ -985,11 +1027,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
   });
 
-  // ---- Project name (URL parameter project=xxx sets the initial value) ----
-  var projectInput = $("projectName");
-  if (params.get("project")) projectInput.value = params.get("project");
-  function currentProject(){ return (projectInput.value || "project").trim(); }
-
   // ---- Generic: upload a file with progress reporting ----
   function uploadFile(file, extraFields, pw, pb, pl){
     return new Promise(function(resolve, reject){
@@ -997,7 +1034,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       fd.append("file", file, file.name);
       for (var k in extraFields){ fd.append(k, extraFields[k]); }
       var xhr = new XMLHttpRequest();
-      xhr.open("POST", "/api/upload?project=" + encodeURIComponent(currentProject()));
+      xhr.open("POST", "/api/upload");
       pw.classList.add("active");
       pb.style.width = "0%";
       pl.textContent = "Uploading... 0%";
@@ -1097,22 +1134,32 @@ INDEX_HTML = r"""<!DOCTYPE html>
   });
 
   // ---- Clear: reset the staged upload so a new file can be selected ----
+  // ---- Clear: reset the staged upload, clear the history display, and
+  // delete all data stored on the server ----
   $("btnClearUpload").addEventListener("click", function(){
-    fileInput.value = "";
-    $("dzFileName").textContent = "";
-    $("tagName").value = "";
-    $("commitMessage").value = "";
-    $("pwUpload").classList.remove("active");
-    $("pbUpload").style.width = "0%";
-    $("plUpload").textContent = "Waiting";
-    $("verTbody").innerHTML = '<tr><td colspan="5" class="muted">Cleared. Upload a snapshot ZIP to add a new version.</td></tr>';
-    toast("Cleared");
+    if (!confirm("Clear the uploaded file and permanently delete all history on the server?")) return;
+    var btn = this; btn.disabled = true;
+    fetch("/api/clear", { method: "POST" })
+      .then(function(r){ return r.json(); })
+      .then(function(){
+        fileInput.value = "";
+        $("dzFileName").textContent = "";
+        $("tagName").value = "";
+        $("commitMessage").value = "";
+        $("pwUpload").classList.remove("active");
+        $("pbUpload").style.width = "0%";
+        $("plUpload").textContent = "Waiting";
+        loadVersions();
+        toast("Cleared");
+      })
+      .catch(function(e){ toast("Failed: " + e.message); })
+      .finally(function(){ btn.disabled = false; });
   });
 
   // ---- Download history ZIP ----
   $("btnDownloadHist").addEventListener("click", function(){
     var btn = this; btn.disabled = true;
-    fetch("/api/zip_history?project=" + encodeURIComponent(currentProject()), { method: "POST" })
+    fetch("/api/zip_history", { method: "POST" })
       .then(function(r){ return r.json(); })
       .then(function(res){ return pollTask(res.task_id, $("pwZipHist"), $("pbZipHist"), $("plZipHist")); })
       .then(function(t){ triggerDownload(t.id); toast("Download started"); })
@@ -1122,7 +1169,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   // ---- Version list ----
   function loadVersions(){
-    fetch("/api/log?project=" + encodeURIComponent(currentProject()))
+    fetch("/api/log")
       .then(function(r){ return r.json(); })
       .then(function(res){
         var tbody = $("verTbody");
@@ -1153,7 +1200,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
           btn.addEventListener("click", function(){
             var hash = btn.getAttribute("data-hash");
             btn.disabled = true;
-            fetch("/api/zip_snapshot?project=" + encodeURIComponent(currentProject()) + "&version=" + encodeURIComponent(hash), { method: "POST" })
+            fetch("/api/zip_snapshot?version=" + encodeURIComponent(hash), { method: "POST" })
               .then(function(r){ return r.json(); })
               .then(function(res){ return pollTask(res.task_id, $("pwZipSnap"), $("pbZipSnap"), $("plZipSnap")); })
               .then(function(t){ triggerDownload(t.id); toast("Download started"); })
@@ -1166,7 +1213,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
           btn.addEventListener("click", function(){
             if (!confirm("Delete the most recent version? This permanently removes it from history.")) return;
             btn.disabled = true;
-            fetch("/api/delete_latest?project=" + encodeURIComponent(currentProject()), { method: "POST" })
+            fetch("/api/delete_latest", { method: "POST" })
               .then(function(r){ return r.json(); })
               .then(function(res){ return pollTask(res.task_id, $("pwZipSnap"), $("pbZipSnap"), $("plZipSnap")); })
               .then(function(t){ toast(t.message || "Deleted"); loadVersions(); })
@@ -1185,8 +1232,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
     });
   }
 
-  projectInput.addEventListener("change", loadVersions);
-
   loadVersions();
 })();
 </script>
@@ -1204,9 +1249,7 @@ def clear_scratch_dirs(data_dir):
     directory and any leftover generated-ZIP files this app previously
     wrote to the system temp folder. Called once at process startup so
     nothing persists across restarts."""
-    if os.path.isdir(data_dir):
-        shutil.rmtree(data_dir)
-    os.makedirs(data_dir, exist_ok=True)
+    clear_data_dir(data_dir)
 
     tmp_dir = tempfile.gettempdir()
     for fp in glob.glob(os.path.join(tmp_dir, "historyzip_*.zip")):
