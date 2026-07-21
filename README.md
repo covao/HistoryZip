@@ -1,5 +1,5 @@
 # HistoryZip
-![Demo Image](https://covao.github.io/HistoryZip/demo.gif)
+![Demo Image](./demo.gif)
 
 ## Overview
 HistoryZip is a single-file Python web app that lets you manage a codebase's Git version history using nothing but ZIP files and a browser, with no Git commands required.
