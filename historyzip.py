@@ -21,9 +21,13 @@ On upload, the ZIP kind is auto-detected (presence of a `.git` folder
 anywhere inside the archive means "history ZIP", otherwise "snapshot ZIP").
 
 Each commit can optionally be given a Git tag name and a commit message
-from the UI. Tags (instead of "verN" labels) are used to identify and
-download specific versions. The most recent version can also be
-permanently deleted from the version history.
+from the UI. Every version always has a tag: if none is given, a
+permanent, sequential one (v0, v1, ...) is auto-generated and persisted
+as a real Git tag, so the Tag column is never blank and never shifts
+just because some other version was deleted. Any version - not just the
+most recent - can be edited (tag name / commit message) or permanently
+deleted; other
+versions' recorded content is preserved exactly when this happens.
 
 Storage: the --data directory is temporary scratch space only. It is
 wiped clean every time this server process starts, and can also be wiped
@@ -217,10 +221,15 @@ def get_tag_map(repo_dir):
     """Return {commit_hash: [tag_name, ...]} for all lightweight tags."""
     if not os.path.isdir(os.path.join(repo_dir, ".git")):
         return {}
-    r = subprocess.run(
-        ["git", "for-each-ref", "refs/tags", "--format=%(objectname) %(refname:short)"],
-        cwd=repo_dir, capture_output=True, text=True,
-    )
+    try:
+        r = subprocess.run(
+            ["git", "for-each-ref", "refs/tags", "--format=%(objectname) %(refname:short)"],
+            cwd=repo_dir, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        return {}
+    if r.returncode != 0:
+        return {}
     tag_map = {}
     for line in r.stdout.splitlines():
         line = line.strip()
@@ -234,33 +243,67 @@ def get_tag_map(repo_dir):
     return tag_map
 
 
+def next_auto_tag(repo_dir):
+    """Return the next stable, sequential auto-tag (e.g. "v7") for this
+    repo, backed by a monotonically increasing counter persisted in the
+    repo's own git config (.git/config - it travels with history ZIP
+    exports/imports since .git is included). The counter is never reused,
+    even if earlier versions are later deleted, so once a version gets an
+    auto-tag it never changes just because something happens to other
+    versions."""
+    r = subprocess.run(
+        ["git", "config", "--get", "historyzip.next-id"],
+        cwd=repo_dir, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    try:
+        n = int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else 0
+    except ValueError:
+        n = 0
+    subprocess.run(["git", "config", "historyzip.next-id", str(n + 1)], cwd=repo_dir, capture_output=True)
+    return "v%d" % n
+
+
 def git_log_entries(repo_dir):
-    """Return commits newest-first, each with an index (0 = oldest) and tags."""
+    """Return commits newest-first, each with an index (0 = oldest) and
+    tags. Any commit that has no tag at all yet is backfilled with a
+    permanent auto-generated one (see next_auto_tag), so every version
+    always has a stable, non-blank identifier to display - this runs on
+    every call, so it also self-heals data created before this existed."""
     if not os.path.isdir(os.path.join(repo_dir, ".git")):
         return []
+    ensure_git_identity(repo_dir)
     out = run_git(
         ["log", "--pretty=format:%H%x1f%h%x1f%cI%x1f%s"],
         cwd=repo_dir,
     )
     lines = [l for l in out.split("\n") if l.strip()]
-    tag_map = get_tag_map(repo_dir)
-    entries = []
+    parsed = []
     for line in lines:
         parts = line.split("\x1f")
         if len(parts) != 4:
             continue
-        h, short, date, subject = parts
+        parsed.append(tuple(parts))  # (hash, short, date, subject)
+    parsed.reverse()  # oldest first
+
+    tag_map = get_tag_map(repo_dir)
+    for h, short, date, subject in parsed:
+        if not tag_map.get(h):
+            auto_tag = next_auto_tag(repo_dir)
+            run_git(["tag", "-f", auto_tag, h], cwd=repo_dir)
+            tag_map.setdefault(h, []).append(auto_tag)
+
+    entries = []
+    for i, (h, short, date, subject) in enumerate(parsed):
         entries.append({
             "hash": h,
             "short": short,
             "date": date,
             "subject": subject,
             "tags": tag_map.get(h, []),
+            "index": i,
+            "fallback_label": "v%d" % i,
         })
-    entries.reverse()  # oldest first, to assign index
-    for i, e in enumerate(entries):
-        e["index"] = i
-        e["fallback_label"] = "v%d" % i
+    for e in entries:
         e["label"] = e["tags"][0] if e["tags"] else e["fallback_label"]
     entries.reverse()  # newest first for display
     return entries
@@ -480,6 +523,70 @@ def do_upload_auto(tid, data_dir, filename, zip_bytes, tag, message):
         do_upload_snapshot(tid, data_dir, filename, zip_bytes, tag, message)
 
 
+def find_version(entries, version_ref):
+    """Find a version entry by hash, short hash, numeric index, or tag
+    name. Deliberately does NOT match on fallback_label: that label is
+    purely positional (recomputed from current index on every call) and
+    uses the same "vN" naming pattern as real auto-generated tags, so
+    matching on it could silently resolve to the wrong commit."""
+    for e in entries:
+        candidates = {e["hash"], e["short"], str(e["index"])} | set(e["tags"])
+        if version_ref in candidates:
+            return e
+    return None
+
+
+def rebuild_commit(wdir, tree_hash, parent_hash, message, date_iso):
+    """Create a new commit object from an existing tree, without touching
+    the working directory. Used to rebuild history so that dropping or
+    editing one version cannot corrupt or merge-conflict with any other
+    version's recorded content: each surviving commit's tree is reused
+    byte-for-byte, only its parent link (and, for the edited commit, its
+    message) changes."""
+    env = os.environ.copy()
+    if date_iso:
+        env["GIT_AUTHOR_DATE"] = date_iso
+        env["GIT_COMMITTER_DATE"] = date_iso
+    cmd = ["git", "commit-tree", tree_hash]
+    if parent_hash:
+        cmd += ["-p", parent_hash]
+    cmd += ["-m", message]
+    r = subprocess.run(
+        cmd, cwd=wdir, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env
+    )
+    if r.returncode != 0:
+        raise GitError("git commit-tree failed: %s" % r.stderr.strip())
+    return r.stdout.strip()
+
+
+def rebuild_history(wdir, entries_oldest_to_newest, skip_hashes=None, message_overrides=None):
+    """Rebuild the linear commit history from a list of original commit
+    entries (oldest first), optionally dropping some (skip_hashes) and/or
+    overriding a commit's message (message_overrides: {old_hash: message}).
+
+    Returns (new_head_hash, {old_hash: new_hash}) for the commits that were
+    kept. This walks each kept commit's *tree* directly (via
+    git commit-tree) rather than replaying diffs (as `git rebase` would),
+    so there is no possibility of a merge conflict and every surviving
+    version's file content is guaranteed to stay byte-for-byte identical.
+    """
+    skip_hashes = skip_hashes or set()
+    message_overrides = message_overrides or {}
+    new_parent = None
+    old_to_new = {}
+    for e in entries_oldest_to_newest:
+        if e["hash"] in skip_hashes:
+            continue
+        tree_hash = run_git(["rev-parse", "%s^{tree}" % e["hash"]], cwd=wdir).strip()
+        message = message_overrides.get(e["hash"])
+        if message is None:
+            message = run_git(["log", "-1", "--format=%B", e["hash"]], cwd=wdir).strip()
+        new_hash = rebuild_commit(wdir, tree_hash, new_parent, message, e["date"])
+        old_to_new[e["hash"]] = new_hash
+        new_parent = new_hash
+    return new_parent, old_to_new
+
+
 def do_zip_history(tid, data_dir):
     try:
         if not os.path.isdir(os.path.join(worktree_dir(data_dir), ".git")):
@@ -500,8 +607,10 @@ def do_zip_history(tid, data_dir):
         task_update(tid, status="error", error=str(e), message="Error: %s" % e)
 
 
-def do_delete_latest(tid, data_dir):
-    """Permanently delete the most recent version (commit) from history."""
+def do_delete_version(tid, data_dir, version_ref):
+    """Permanently delete an arbitrary version (commit) from history. The
+    remaining commits are rebuilt on top of each other so their recorded
+    content is preserved exactly, regardless of which version is removed."""
     try:
         wdir = worktree_dir(data_dir)
         if not os.path.isdir(os.path.join(wdir, ".git")):
@@ -511,14 +620,81 @@ def do_delete_latest(tid, data_dir):
         if len(entries) < 2:
             raise GitError("Cannot delete the only remaining version.")
 
-        latest = entries[0]
-        task_update(tid, message="Deleting the latest version...", progress=30)
-        ensure_git_identity(wdir)
-        for t in latest["tags"]:
-            run_git(["tag", "-d", t], cwd=wdir)
-        run_git(["reset", "--hard", "HEAD~1"], cwd=wdir)
+        target = find_version(entries, version_ref)
+        if target is None:
+            raise GitError("The requested version could not be found.")
 
-        task_update(tid, status="done", progress=100, message="Deleted the latest version")
+        task_update(tid, message="Rebuilding history...", progress=20)
+        ensure_git_identity(wdir)
+        oldest_to_newest = list(reversed(entries))
+        new_head, old_to_new = rebuild_history(wdir, oldest_to_newest, skip_hashes={target["hash"]})
+
+        task_update(tid, message="Updating tags...", progress=80)
+        for e in oldest_to_newest:
+            if e["hash"] == target["hash"]:
+                continue
+            for t in e["tags"]:
+                run_git(["tag", "-f", t, old_to_new[e["hash"]]], cwd=wdir)
+        for t in target["tags"]:
+            run_git(["tag", "-d", t], cwd=wdir)
+
+        task_update(tid, message="Updating working tree...", progress=95)
+        run_git(["reset", "--hard", new_head], cwd=wdir)
+
+        task_update(tid, status="done", progress=100, message="Deleted version %s" % target["label"])
+    except Exception as e:  # noqa
+        task_update(tid, status="error", error=str(e), message="Error: %s" % e)
+
+
+def do_edit_version(tid, data_dir, version_ref, new_tag, new_message):
+    """Edit an arbitrary version's tag name and/or commit message. The
+    version's recorded file content (tree) is untouched; only its message
+    and tag change. All other versions are rebuilt on top of each other
+    with their content preserved exactly, same as do_delete_version()."""
+    try:
+        wdir = worktree_dir(data_dir)
+        if not os.path.isdir(os.path.join(wdir, ".git")):
+            raise GitError("There is no history yet.")
+
+        entries = git_log_entries(wdir)
+        target = find_version(entries, version_ref)
+        if target is None:
+            raise GitError("The requested version could not be found.")
+
+        task_update(tid, message="Rebuilding history...", progress=20)
+        ensure_git_identity(wdir)
+        oldest_to_newest = list(reversed(entries))
+
+        overrides = {}
+        clean_message = (new_message or "").strip()
+        if clean_message:
+            overrides[target["hash"]] = clean_message
+
+        new_head, old_to_new = rebuild_history(wdir, oldest_to_newest, message_overrides=overrides)
+
+        task_update(tid, message="Updating tags...", progress=80)
+        for e in oldest_to_newest:
+            if e["hash"] == target["hash"]:
+                continue
+            for t in e["tags"]:
+                run_git(["tag", "-f", t, old_to_new[e["hash"]]], cwd=wdir)
+        clean_tag = sanitize_tag_name(new_tag)
+        if clean_tag:
+            # Explicit new tag: replace whatever this version had before.
+            for t in target["tags"]:
+                run_git(["tag", "-d", t], cwd=wdir)
+            run_git(["tag", "-f", clean_tag, old_to_new[target["hash"]]], cwd=wdir)
+        else:
+            # No new tag given: keep this version's existing tag(s) - auto
+            # or custom - unchanged, just repoint them to its (possibly
+            # new, if the message changed) commit hash.
+            for t in target["tags"]:
+                run_git(["tag", "-f", t, old_to_new[target["hash"]]], cwd=wdir)
+
+        task_update(tid, message="Updating working tree...", progress=95)
+        run_git(["reset", "--hard", new_head], cwd=wdir)
+
+        task_update(tid, status="done", progress=100, message="Updated version")
     except Exception as e:  # noqa
         task_update(tid, status="error", error=str(e), message="Error: %s" % e)
 
@@ -531,12 +707,7 @@ def do_zip_snapshot(tid, data_dir, version_ref):
             raise GitError("There is no history yet.")
 
         entries = git_log_entries(wdir)
-        target = None
-        for e in entries:
-            candidates = {e["hash"], e["short"], e["fallback_label"], str(e["index"])} | set(e["tags"])
-            if version_ref in candidates:
-                target = e
-                break
+        target = find_version(entries, version_ref)
         if target is None and entries:
             target = entries[0]
         if target is None:
@@ -730,9 +901,22 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 th.start()
                 self._send_json({"task_id": tid})
-            elif path == "/api/delete_latest":
+            elif path == "/api/delete_version":
+                version = qs.get("version", [""])[0]
                 tid = task_create()
-                th = threading.Thread(target=do_delete_latest, args=(tid, self.data_dir), daemon=True)
+                th = threading.Thread(
+                    target=do_delete_version, args=(tid, self.data_dir, version), daemon=True
+                )
+                th.start()
+                self._send_json({"task_id": tid})
+            elif path == "/api/edit_version":
+                version = qs.get("version", [""])[0]
+                new_tag = qs.get("tag", [""])[0]
+                new_message = qs.get("message", [""])[0]
+                tid = task_create()
+                th = threading.Thread(
+                    target=do_edit_version, args=(tid, self.data_dir, version, new_tag, new_message), daemon=True
+                )
                 th.start()
                 self._send_json({"task_id": tid})
             elif path == "/api/clear":
@@ -894,6 +1078,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
   }
   .tag-badge.none{ background:#f1f2f4; color:var(--muted); font-weight:500; }
   .actions button{ width:auto; margin:0 0 0 6px; padding:5px 10px; font-size:12px; }
+  .actions button:first-child{ margin-left:0; }
+  td.col-tag input, td.col-message input{
+    width:100%; padding:5px 7px; border:1px solid var(--border); border-radius:5px;
+    font-size:12.5px; background:#fff; color:var(--text);
+  }
   .muted{ color:var(--muted); font-size:12px; }
   .toast{
     position:fixed; bottom:18px; left:50%; transform:translateX(-50%);
@@ -1179,18 +1368,26 @@ INDEX_HTML = r"""<!DOCTYPE html>
           return;
         }
         var onlyOneVersion = res.versions.length < 2;
-        res.versions.forEach(function(v, idx){
+        res.versions.forEach(function(v){
           var tr = document.createElement("tr");
-          var badgeClass = (v.tags && v.tags.length) ? "tag-badge" : "tag-badge none";
-          var actionsHtml = '<button data-action="download" data-hash="' + v.hash + '">Download snapshot</button>';
-          if (idx === 0){
-            actionsHtml +=
-              '<button class="danger" data-action="delete"' + (onlyOneVersion ? " disabled" : "") + '>Delete</button>';
-          }
+          tr.setAttribute("data-hash", v.hash);
+          // Versions with no explicit tag get a permanent, stable
+          // auto-generated one from the server (e.g. "v3") so this column
+          // is never blank. Custom tags get the bright badge; auto ones
+          // (matching /^v\d+$/) get the muted badge so they're still
+          // visually distinguishable from a name the user actually chose.
+          var hasTag = v.tags && v.tags.length > 0;
+          var tagText = hasTag ? v.tags[0] : "\u2014";
+          var isAutoTag = hasTag && /^v\d+$/.test(v.tags[0]);
+          var badgeClass = (hasTag && !isAutoTag) ? "tag-badge" : "tag-badge none";
+          var actionsHtml =
+            '<button data-action="download" data-hash="' + v.hash + '">Download snapshot</button>' +
+            '<button class="secondary" data-action="edit" data-hash="' + v.hash + '">Edit</button>' +
+            '<button class="danger" data-action="delete" data-hash="' + v.hash + '"' + (onlyOneVersion ? " disabled" : "") + '>Delete</button>';
           tr.innerHTML =
-            '<td><span class="' + badgeClass + '">' + escapeHtml(v.label) + '</span></td>' +
+            '<td class="col-tag"><span class="' + badgeClass + '">' + escapeHtml(tagText) + '</span></td>' +
             '<td>' + (v.date||"").replace("T"," ").slice(0,19) + '</td>' +
-            '<td>' + escapeHtml(v.subject||"") + '</td>' +
+            '<td class="col-message">' + escapeHtml(v.subject||"") + '</td>' +
             '<td class="muted">' + v.short + '</td>' +
             '<td class="actions">' + actionsHtml + '</td>';
           tbody.appendChild(tr);
@@ -1209,13 +1406,55 @@ INDEX_HTML = r"""<!DOCTYPE html>
           });
         });
 
+        // ---- Edit: turns the Tag and Message cells of that row into
+        // inline inputs, with Save / Cancel replacing the row's actions ----
+        tbody.querySelectorAll('button[data-action="edit"]').forEach(function(btn){
+          btn.addEventListener("click", function(){
+            var hash = btn.getAttribute("data-hash");
+            var v = res.versions.find(function(x){ return x.hash === hash; });
+            var tr = btn.closest("tr");
+            var tagTd = tr.querySelector(".col-tag");
+            var msgTd = tr.querySelector(".col-message");
+            var actionsTd = tr.querySelector(".actions");
+            var currentTagRaw = (v && v.tags && v.tags.length) ? v.tags[0] : "";
+            var currentTag = /^v\d+$/.test(currentTagRaw) ? "" : currentTagRaw;
+            var currentMessage = (v && v.subject) || "";
+
+            tagTd.innerHTML = '<input type="text" class="edit-tag" placeholder="no tag">';
+            msgTd.innerHTML = '<input type="text" class="edit-message">';
+            tagTd.querySelector("input").value = currentTag;
+            msgTd.querySelector("input").value = currentMessage;
+            actionsTd.innerHTML =
+              '<button data-action="save">Save</button>' +
+              '<button class="secondary" data-action="cancel">Cancel</button>';
+
+            actionsTd.querySelector('button[data-action="cancel"]').addEventListener("click", function(){
+              loadVersions();
+            });
+            actionsTd.querySelector('button[data-action="save"]').addEventListener("click", function(){
+              var newTag = tagTd.querySelector("input").value;
+              var newMessage = msgTd.querySelector("input").value;
+              var saveBtn = actionsTd.querySelector('button[data-action="save"]');
+              saveBtn.disabled = true;
+              var url = "/api/edit_version?version=" + encodeURIComponent(hash) +
+                "&tag=" + encodeURIComponent(newTag) + "&message=" + encodeURIComponent(newMessage);
+              fetch(url, { method: "POST" })
+                .then(function(r){ return r.json(); })
+                .then(function(res2){ return pollTask(res2.task_id, $("pwZipSnap"), $("pbZipSnap"), $("plZipSnap")); })
+                .then(function(t){ toast(t.message || "Updated"); loadVersions(); })
+                .catch(function(e){ toast("Failed: " + e.message); saveBtn.disabled = false; });
+            });
+          });
+        });
+
         tbody.querySelectorAll('button[data-action="delete"]').forEach(function(btn){
           btn.addEventListener("click", function(){
-            if (!confirm("Delete the most recent version? This permanently removes it from history.")) return;
+            var hash = btn.getAttribute("data-hash");
+            if (!confirm("Delete this version? This permanently removes it from history.")) return;
             btn.disabled = true;
-            fetch("/api/delete_latest", { method: "POST" })
+            fetch("/api/delete_version?version=" + encodeURIComponent(hash), { method: "POST" })
               .then(function(r){ return r.json(); })
-              .then(function(res){ return pollTask(res.task_id, $("pwZipSnap"), $("pbZipSnap"), $("plZipSnap")); })
+              .then(function(res2){ return pollTask(res2.task_id, $("pwZipSnap"), $("pbZipSnap"), $("plZipSnap")); })
               .then(function(t){ toast(t.message || "Deleted"); loadVersions(); })
               .catch(function(e){ toast("Failed: " + e.message); btn.disabled = false; });
           });

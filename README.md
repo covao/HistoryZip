@@ -16,11 +16,13 @@ Then open http://localhost:8765/ in your browser.
 - Snapshot vs. history ZIPs are detected automatically on upload, no need to choose
 - Drag-and-drop or click-to-browse ZIP upload with a live progress bar
 - Tag each version with a custom name and commit message
+- Edit the tag name and commit message of any version, not just the latest
+- Delete any version from history, not just the latest, without affecting any other version's content
 - Download the full history ZIP (including `.git`) at any time
 - Download a snapshot ZIP of any past version by tag, hash, or index
-- Delete the most recent version from history
 - Responsive UI that works on desktop, tablet, and smartphone screens
-- All working data is temporary: it is cleared automatically every time the server starts
+- The "Clear" button wipes the uploaded file, the history display, and the data folder on the server
+- All working data is temporary: the data folder is deleted automatically every time the server starts
 
 ## Requirements
 - OS: Linux, macOS, or Windows
